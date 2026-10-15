@@ -1,0 +1,66 @@
+services:
+  # =================================================================
+  # Option 1: Render Private Service (pserv)
+  # =================================================================
+  # Runs internally with NO open public web ports.
+  # Pulls upload tasks from Telegram Serverless queue via outbound HTTPS.
+  # Completely safe from unauthorized web scrapers.
+  # Note: Render requires the 'starter' plan ($7/mo) for pserv.
+  # =================================================================
+  - type: pserv
+    name: tg-anime-mirror-private
+    env: python
+    region: frankfurt
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: MIRROR_SECRET_KEY
+        sync: false
+      - key: TGCLOUD_QUEUE_URL
+        sync: false
+      - key: POLL_QUEUE
+        value: "true"
+      - key: POLL_INTERVAL
+        value: "5.0"
+      - key: TG_PROXY
+        sync: false
+
+  # =================================================================
+  # Option 2: Render Web Service (100% Free Plan $0/mo)
+  # =================================================================
+  # If you want to run completely FREE on Render:
+  # 1. Comment out or delete the 'pserv' service above.
+  # 2. Uncomment this 'web' service block below.
+  # It supports both background queue polling AND direct /api/upload.
+  # =================================================================
+  # - type: web
+  #   name: tg-anime-mirror-web
+  #   env: python
+  #   region: frankfurt
+  #   plan: free
+  #   buildCommand: pip install -r requirements.txt
+  #   startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+  #   envVars:
+  #     - key: TELEGRAM_BOT_TOKEN
+  #       sync: false
+  #     - key: TELEGRAM_API_ID
+  #       sync: false
+  #     - key: TELEGRAM_API_HASH
+  #       sync: false
+  #     - key: MIRROR_SECRET_KEY
+  #       sync: false
+  #     - key: TGCLOUD_QUEUE_URL
+  #       sync: false
+  #     - key: POLL_QUEUE
+  #       value: "true"
+  #     - key: POLL_INTERVAL
+  #       value: "5.0"
+  #     - key: TG_PROXY
+  #       sync: false
