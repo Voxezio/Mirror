@@ -23,7 +23,7 @@ class VideoUploader:
         self.bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         self.api_id = os.getenv("TELEGRAM_API_ID", "").strip()
         self.api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
-        self.http_proxy = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
+        self.http_proxy = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("TG_PROXY")
         self.secret_key = os.getenv("MIRROR_SECRET_KEY", "").strip()
 
         self._pyro_app = None
