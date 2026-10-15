@@ -8,7 +8,7 @@ services:
   # Note: Render requires the 'starter' plan ($7/mo) for pserv.
   # =================================================================
   - type: pserv
-    name: tg-anime-mirror-private
+    name: botquerify-private
     env: python
     region: frankfurt
     plan: starter
@@ -41,7 +41,7 @@ services:
   # It supports both background queue polling AND direct /api/upload.
   # =================================================================
   # - type: web
-  #   name: tg-anime-mirror-web
+  #   name: botquerify-web
   #   env: python
   #   region: frankfurt
   #   plan: free

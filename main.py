@@ -1,4 +1,4 @@
-# mirror/main.py — Private Telegram Video Ingest Microservice & Render Worker
+# BotQuerify — Telegram Video Ingest Microservice & Cloud Worker
 import os
 import sys
 import logging
@@ -21,7 +21,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("mirror.main")
+logger = logging.getLogger("botquerify.main")
 
 from uploader import uploader_instance
 
@@ -160,7 +160,7 @@ async def queue_poller(queue_url: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Mirror Microservice is starting...")
+    logger.info("BotQuerify Microservice is starting...")
     poller_task = None
     poll_enabled = os.getenv("POLL_QUEUE", "true").strip().lower() in ("true", "1", "yes")
     queue_url = os.getenv("TGCLOUD_QUEUE_URL", "").strip()
@@ -180,22 +180,22 @@ async def lifespan(app: FastAPI):
             await poller_task
         except asyncio.CancelledError:
             pass
-    logger.info("Mirror Microservice is shutting down...")
+    logger.info("BotQuerify Microservice is shutting down...")
 
 app = FastAPI(
-    title="Telegram Anime Mirror Uploader",
+    title="BotQuerify — Telegram Video Ingest Service",
     description="Private microservice that downloads anime streams and uploads them to Telegram as native video files.",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for hostings (Render, Koyeb, Hugging Face)."""
+    """Health check endpoint for hostings (Zeabur, Koyeb, Render)."""
     return {
         "status": "ok",
-        "service": "telegram-anime-mirror",
+        "service": "BotQuerify",
         "worker_mode": "polling_and_webhook",
         "mtproto_2gb_enabled": bool(uploader_instance.api_id and uploader_instance.api_hash),
         "proxy_enabled": bool(uploader_instance.http_proxy),

@@ -1,4 +1,4 @@
-# 🚀 Telegram Anime Mirror Uploader Service
+# 🚀 BotQuerify — Telegram Video Ingest Service
 
 Приватный фоновый микросервис для загрузки серий аниме в Telegram как нативных видеофайлов (до 2000 МБ / 2 ГБ) с поддержкой стриминга прямо в чате.
 

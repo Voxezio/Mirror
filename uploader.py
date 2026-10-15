@@ -1,4 +1,4 @@
-# mirror/uploader.py — Video downloader & Telegram uploader engine
+# BotQuerify / uploader.py — Video downloader & Telegram uploader engine
 import os
 import sys
 import json
@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 import httpx
 
-logger = logging.getLogger("mirror.uploader")
+logger = logging.getLogger("botquerify.uploader")
 
 # Pyrogram optional import for 2 GB MTProto uploads
 try:
@@ -43,7 +43,7 @@ class VideoUploader:
             if self._pyro_app is None:
                 session_dir = Path("/tmp/pyrogram_session")
                 session_dir.mkdir(parents=True, exist_ok=True)
-                session_name = str(session_dir / "mirror_bot")
+                session_name = str(session_dir / "botquerify_bot")
 
                 self._pyro_app = PyrogramClient(
                     session_name,
@@ -217,7 +217,7 @@ class VideoUploader:
         callback_url = task.get("callbackUrl")
 
         cache_key = f"ep:{release_id}:{type_id}:{source_id}:{position}"
-        temp_dir = Path("/tmp/mirror_videos")
+        temp_dir = Path("/tmp/botquerify_videos")
         temp_path = temp_dir / f"{release_id}_{type_id}_{source_id}_{position}.mp4"
 
         try:
