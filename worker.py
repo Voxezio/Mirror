@@ -90,9 +90,10 @@ async def process_single_task(task: dict, slot_id: int):
     position = task.get("position", 1)
     chat_id = task.get("chatId")
     stream_url = task.get("streamUrl")
+    q_indicator = task.get("queueIndicator") or "1\\1"
 
     prefix = f"{BOLD}{MAGENTA}[Слот {slot_id}/{MAX_CONCURRENT_FILES}]{RESET}"
-    logger.info(f"{prefix} {GREEN}▶️ Взята задача:{RESET} «{BOLD}{title}{RESET}» — {BOLD}{position} серия{RESET} (чат {chat_id})")
+    logger.info(f"{prefix} {GREEN}▶️ Взята задача:{RESET} «{BOLD}{title}{RESET}» — {BOLD}{position} серия{RESET} (чат {chat_id}, очередь {BOLD}{CYAN}{q_indicator}{RESET})")
 
     last_log_time = 0.0
 

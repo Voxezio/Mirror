@@ -89,7 +89,12 @@ async def pull_task() -> Optional[Dict[str, Any]]:
     # 2. TGCloud Cloud DB check
     res = await run_tgcloud_command("pull", {})
     if res and res.get("ok"):
-        return res.get("task")
+        task = res.get("task")
+        if task:
+            task["queueIndicator"] = res.get("queueIndicator", "1\\1")
+            task["queueStats"] = res.get("queueStats")
+            task["remaining"] = res.get("remaining", 0)
+        return task
 
     return None
 
