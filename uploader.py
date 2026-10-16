@@ -5,6 +5,7 @@ import json
 import asyncio
 import logging
 from pathlib import Path
+import urllib.parse
 from dotenv import load_dotenv
 import httpx
 
@@ -32,7 +33,7 @@ except Exception as e:
     PYROGRAM_AVAILABLE = False
     PyrogramClient = None
 
-from downloader import download_video, DownloadProgress
+from downloader import download_video, DownloadProgress, compress_to_target_size
 
 class VideoUploader:
     def __init__(self):
@@ -63,12 +64,22 @@ class VideoUploader:
                 session_dir.mkdir(parents=True, exist_ok=True)
                 session_name = str(session_dir / "botquerify_bot")
 
+                proxy_dict = None
+                if self.http_proxy:
+                    parsed_p = urllib.parse.urlparse(self.http_proxy)
+                    proxy_dict = {
+                        "scheme": parsed_p.scheme or "http",
+                        "hostname": parsed_p.hostname or "127.0.0.1",
+                        "port": parsed_p.port or 7890,
+                    }
+
                 self._pyro_app = PyrogramClient(
                     session_name,
                     api_id=int(self.api_id),
                     api_hash=self.api_hash,
                     bot_token=self.bot_token,
                     workdir=str(session_dir),
+                    proxy=proxy_dict,
                 )
                 await self._pyro_app.start()
                 logger.info("Pyrogram MTProto client started successfully!")
@@ -107,7 +118,7 @@ class VideoUploader:
         if reply_markup:
             data["reply_markup"] = json.dumps(reply_markup)
 
-        async with httpx.AsyncClient(timeout=300.0) as client:
+        async with httpx.AsyncClient(proxy=self.http_proxy, timeout=300.0) as client:
             with open(file_path, "rb") as video_file:
                 files = {"video": (file_path.name, video_file, "video/mp4")}
                 res = await client.post(api_url, data=data, files=files)
@@ -165,25 +176,41 @@ class VideoUploader:
         }
 
     async def upload_video(self, chat_id: int, file_path: Path, caption: str, reply_markup: dict = None) -> dict:
-        """Automatically choose between Pyrogram (2 GB) and Bot API (50 MB)."""
+        """Automatically choose between Pyrogram (2 GB), direct Bot API (50 MB), or auto-compression."""
         file_size_mb = file_path.stat().st_size / (1024 * 1024)
         logger.info(f"Target video file size: {file_size_mb:.2f} MB")
 
-        # 1. If Pyrogram MTProto credentials are configured, always prefer Pyrogram
+        # 1. If Pyrogram MTProto credentials are configured, always prefer Pyrogram (up to 2000 MB)
         if self.api_id and self.api_hash and PYROGRAM_AVAILABLE:
             try:
                 return await self.upload_via_pyrogram(chat_id, file_path, caption, reply_markup)
             except Exception as e:
-                logger.warning(f"Pyrogram upload error: {e}. Falling back to Bot API if size <= 50MB...")
+                logger.warning(f"Pyrogram upload error: {e}. Falling back to Bot API...")
 
-        # 2. If under 50 MB, use standard Telegram Bot API
+        # 2. If under 50 MB, use standard Telegram Bot API directly
         if file_size_mb <= 50.0:
             return await self.upload_via_bot_api(chat_id, file_path, caption, reply_markup)
 
-        # 3. If over 50 MB and no Pyrogram credentials
+        # 3. If over 50 MB and no Pyrogram credentials, bypass 50MB limit via smart FFmpeg compression
+        logger.info(
+            f"File is {file_size_mb:.1f} MB (> 50 MB limit). Bypassing limit via smart FFmpeg compression to 48.5 MB..."
+        )
+        compressed_path = file_path.parent / f"compressed_{file_path.name}"
+        try:
+            success = await compress_to_target_size(file_path, compressed_path, target_mb=48.5)
+            if success and compressed_path.exists() and compressed_path.stat().st_size <= 50 * 1024 * 1024:
+                return await self.upload_via_bot_api(chat_id, compressed_path, caption, reply_markup)
+        finally:
+            if compressed_path.exists():
+                try:
+                    compressed_path.unlink()
+                except Exception:
+                    pass
+
+        # 4. Fallback error if compression somehow failed
         raise RuntimeError(
             f"File is {file_size_mb:.1f} MB (> 50 MB Bot API limit). "
-            f"To send videos larger than 50 MB, set TELEGRAM_API_ID and TELEGRAM_API_HASH in .env from https://my.telegram.org/"
+            f"To send original 1080p/720p files without compression, set TELEGRAM_API_ID and TELEGRAM_API_HASH in .env from https://my.telegram.org/"
         )
 
     async def notify_callback(self, callback_url: str, payload: dict):

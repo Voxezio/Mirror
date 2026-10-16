@@ -8,11 +8,14 @@ import shutil
 import urllib.parse
 from pathlib import Path
 from typing import Optional, Dict, List, Callable, Tuple
+import time
+import aiofiles
 import httpx
 
 logger = logging.getLogger("botquerify.downloader")
 
 FFMPEG_BIN = os.getenv("FFMPEG_PATH") or shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+FFPROBE_BIN = os.getenv("FFPROBE_PATH") or shutil.which("ffprobe") or "/usr/bin/ffprobe"
 
 class DownloadProgress:
     def __init__(self, total_bytes: int = 0, total_segments: int = 0, title: str = ""):
@@ -22,17 +25,15 @@ class DownloadProgress:
         self.downloaded_segments = 0
         self.title = title
         self.mode = "init"
-        self._lock = asyncio.Lock()
+        self._last_callback = 0.0
 
-    async def update_bytes(self, chunk_len: int):
-        async with self._lock:
-            self.downloaded_bytes += chunk_len
+    def update_bytes(self, chunk_len: int):
+        self.downloaded_bytes += chunk_len
 
-    async def update_segment(self, bytes_len: int = 0):
-        async with self._lock:
-            self.downloaded_segments += 1
-            if bytes_len:
-                self.downloaded_bytes += bytes_len
+    def update_segment(self, bytes_len: int = 0):
+        self.downloaded_segments += 1
+        if bytes_len:
+            self.downloaded_bytes += bytes_len
 
     def get_progress_pct(self) -> float:
         if self.mode == "hls" and self.total_segments > 0:
@@ -52,6 +53,82 @@ class DownloadProgress:
             if tot_mb > 0:
                 return f"Range [{cur_mb:.1f}/{tot_mb:.1f} MB] {pct:.1f}%"
             return f"Stream [{cur_mb:.1f} MB]"
+
+
+async def get_video_duration(file_path: Path) -> float:
+    """Get video duration in seconds via ffprobe."""
+    cmd = [
+        FFPROBE_BIN,
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(file_path),
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            return float(stdout.decode().strip())
+    except Exception as e:
+        logger.warning(f"Failed to probe duration for {file_path.name}: {e}")
+    return 1400.0
+
+
+async def compress_to_target_size(input_path: Path, output_path: Path, target_mb: float = 48.5) -> bool:
+    """Compress video with FFmpeg to fit strictly under target_mb (bypassing Telegram 50MB Bot API limit)."""
+    if not Path(FFMPEG_BIN).exists():
+        logger.error(f"FFmpeg binary not found at {FFMPEG_BIN}")
+        return False
+
+    duration = await get_video_duration(input_path)
+    if duration <= 0:
+        duration = 1400.0
+
+    target_bits = target_mb * 8 * 1024 * 1024
+    total_bitrate = int(target_bits / duration)
+    audio_bitrate = min(96_000, max(48_000, int(total_bitrate * 0.15)))
+    video_bitrate = total_bitrate - audio_bitrate
+
+    if video_bitrate < 160_000:
+        video_bitrate = 160_000
+
+    logger.info(
+        f"Compressing {input_path.name} ({input_path.stat().st_size / (1024 * 1024):.1f} MB, {duration:.0f}s) "
+        f"to target {target_mb} MB: video_bitrate={video_bitrate // 1000}k, audio_bitrate={audio_bitrate // 1000}k"
+    )
+
+    cmd = [
+        FFMPEG_BIN,
+        "-y",
+        "-i", str(input_path),
+        "-c:v", "libx264",
+        "-preset", "faster",
+        "-b:v", f"{video_bitrate}",
+        "-maxrate", f"{int(video_bitrate * 1.25)}",
+        "-bufsize", f"{int(video_bitrate * 2)}",
+        "-vf", "scale=-2:'min(720,ih)'",
+        "-c:a", "aac",
+        "-b:a", f"{audio_bitrate}",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        logger.error(f"FFmpeg compression failed: {stderr.decode(errors='replace')[-300:]}")
+        return False
+
+    if output_path.exists():
+        out_mb = output_path.stat().st_size / (1024 * 1024)
+        logger.info(f"Compressed successfully: {output_path.name} ({out_mb:.2f} MB)")
+        return True
+    return False
 
 
 async def remux_video(input_path: Path, output_path: Path) -> bool:
@@ -209,35 +286,40 @@ async def _download_http_multichunk(
 
     # Multi-stream Range download
     progress.total_bytes = total_length
-    num_streams = min(num_streams, 16)
-    chunk_size = total_length // num_streams
+    effective_streams = min(max(num_streams, 16), 32)
+    chunk_size = total_length // effective_streams
     logger.info(
-        f"Downloading with {num_streams} concurrent Range streams. Total size: {total_length / (1024 * 1024):.2f} MB"
+        f"Downloading with {effective_streams} concurrent Range streams. Total size: {total_length / (1024 * 1024):.2f} MB"
     )
 
     ranges: List[Tuple[int, int, Path]] = []
-    for i in range(num_streams):
+    for i in range(effective_streams):
         start = i * chunk_size
-        end = total_length - 1 if i == num_streams - 1 else (start + chunk_size - 1)
+        end = total_length - 1 if i == effective_streams - 1 else (start + chunk_size - 1)
         part_file = temp_dir / f"part_{i:02d}.tmp"
         ranges.append((start, end, part_file))
+
+    limits = httpx.Limits(max_connections=effective_streams + 4, max_keepalive_connections=effective_streams + 4)
 
     async def _fetch_range(start_byte: int, end_byte: int, out_file: Path, stream_idx: int):
         range_headers = {**headers, "Range": f"bytes={start_byte}-{end_byte}"}
         retries = 3
         for attempt in range(retries):
             try:
-                async with httpx.AsyncClient(proxy=proxy, timeout=120.0, follow_redirects=True) as c:
+                async with httpx.AsyncClient(proxy=proxy, timeout=120.0, limits=limits, follow_redirects=True) as c:
                     async with c.stream("GET", url, headers=range_headers) as r:
                         if r.status_code not in (200, 206):
                             raise RuntimeError(f"Stream {stream_idx} returned {r.status_code}")
-                        with open(out_file, "wb") as pf:
-                            async for b in r.aiter_bytes(chunk_size=256 * 1024):
+                        async with aiofiles.open(out_file, "wb") as pf:
+                            async for b in r.aiter_bytes(chunk_size=1024 * 1024):
                                 if b:
-                                    pf.write(b)
-                                    await progress.update_bytes(len(b))
+                                    await pf.write(b)
+                                    progress.update_bytes(len(b))
                                     if progress_callback:
-                                        progress_callback(progress)
+                                        now = time.time()
+                                        if now - progress._last_callback > 0.8:
+                                            progress._last_callback = now
+                                            progress_callback(progress)
                 return
             except Exception as ex:
                 if attempt == retries - 1:
@@ -253,7 +335,11 @@ async def _download_http_multichunk(
     with open(raw_path, "wb") as outfile:
         for _, _, part_file in ranges:
             with open(part_file, "rb") as infile:
-                shutil.copyfileobj(infile, outfile, length=4 * 1024 * 1024)
+                shutil.copyfileobj(infile, outfile, length=16 * 1024 * 1024)
+            try:
+                part_file.unlink()
+            except Exception:
+                pass
 
     return raw_path
 
@@ -306,34 +392,40 @@ async def _download_hls(
         logger.warning("No segments parsed from HLS playlist. Falling back to FFmpeg...")
         return await _download_hls_via_ffmpeg(url, headers, temp_dir, proxy)
 
+    hls_workers = min(max(num_streams, 16), 32)
     progress.total_segments = len(segment_urls)
-    logger.info(f"HLS playlist contains {len(segment_urls)} segments. Downloading with {num_streams} parallel workers...")
+    logger.info(f"HLS playlist contains {len(segment_urls)} segments. Downloading with {hls_workers} parallel workers...")
 
-    semaphore = asyncio.Semaphore(num_streams)
+    semaphore = asyncio.Semaphore(hls_workers)
     seg_dir = temp_dir / "segments"
     seg_dir.mkdir(parents=True, exist_ok=True)
 
-    async def _fetch_segment(seg_url: str, seg_idx: int):
-        async with semaphore:
-            seg_path = seg_dir / f"seg_{seg_idx:05d}.ts"
-            retries = 3
-            for attempt in range(retries):
-                try:
-                    async with httpx.AsyncClient(proxy=proxy, timeout=45.0, follow_redirects=True) as sc:
+    limits = httpx.Limits(max_connections=hls_workers + 6, max_keepalive_connections=hls_workers + 6)
+    async with httpx.AsyncClient(proxy=proxy, timeout=60.0, limits=limits, follow_redirects=True) as sc:
+        async def _fetch_segment(seg_url: str, seg_idx: int):
+            async with semaphore:
+                seg_path = seg_dir / f"seg_{seg_idx:05d}.ts"
+                retries = 3
+                for attempt in range(retries):
+                    try:
                         sr = await sc.get(seg_url, headers=headers)
                         if sr.status_code == 200:
-                            seg_path.write_bytes(sr.content)
-                            await progress.update_segment(len(sr.content))
+                            async with aiofiles.open(seg_path, "wb") as f:
+                                await f.write(sr.content)
+                            progress.update_segment(len(sr.content))
                             if progress_callback:
-                                progress_callback(progress)
+                                now = time.time()
+                                if now - progress._last_callback > 0.8:
+                                    progress._last_callback = now
+                                    progress_callback(progress)
                             return
-                except Exception as ex:
-                    if attempt == retries - 1:
-                        logger.error(f"Segment {seg_idx} failed: {ex}")
-                        raise
-                    await asyncio.sleep(0.5 * (attempt + 1))
+                    except Exception as ex:
+                        if attempt == retries - 1:
+                            logger.error(f"Segment {seg_idx} failed: {ex}")
+                            raise
+                        await asyncio.sleep(0.5 * (attempt + 1))
 
-    await asyncio.gather(*[_fetch_segment(s_url, i) for i, s_url in enumerate(segment_urls)])
+        await asyncio.gather(*[_fetch_segment(s_url, i) for i, s_url in enumerate(segment_urls)])
 
     # Create concat list for FFmpeg
     concat_list_file = temp_dir / "concat_list.txt"
