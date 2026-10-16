@@ -5,18 +5,34 @@ import json
 import asyncio
 import logging
 from pathlib import Path
+from dotenv import load_dotenv
 import httpx
+
+BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+load_dotenv(BASE_DIR / ".env")
+
+# Ensure event loop exists before importing Pyrogram on Python 3.14+
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
 logger = logging.getLogger("botquerify.uploader")
 
 # Pyrogram optional import for 2 GB MTProto uploads
 try:
     from pyrogram import Client as PyrogramClient
-    from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
     PYROGRAM_AVAILABLE = True
-except ImportError:
+except Exception as e:
+    logger.warning(f"Pyrogram import failed ({e}). Will use Telegram Bot API (50 MB limit).")
     PYROGRAM_AVAILABLE = False
     PyrogramClient = None
+
+from downloader import download_video, DownloadProgress
 
 class VideoUploader:
     def __init__(self):
@@ -25,6 +41,7 @@ class VideoUploader:
         self.api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
         self.http_proxy = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("TG_PROXY")
         self.secret_key = os.getenv("MIRROR_SECRET_KEY", "").strip()
+        self.chunks_per_file = int(os.getenv("CHUNKS_PER_FILE", "6"))
 
         self._pyro_app = None
         self._lock = asyncio.Lock()
@@ -32,7 +49,8 @@ class VideoUploader:
         logger.info(
             f"Initialized VideoUploader (Pyrogram available: {PYROGRAM_AVAILABLE}, "
             f"MTProto 2GB mode: {bool(self.api_id and self.api_hash)}, "
-            f"Proxy: {bool(self.http_proxy)})"
+            f"Proxy: {bool(self.http_proxy)}, "
+            f"Streams per file: {self.chunks_per_file})"
         )
 
     async def _get_pyrogram_client(self):
@@ -57,43 +75,27 @@ class VideoUploader:
 
         return self._pyro_app
 
-    async def download_file(self, url: str, headers: dict, dest_path: Path) -> int:
-        """Download remote video file with streaming to dest_path."""
-        logger.info(f"Downloading stream from: {url}")
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-
-        req_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-            **(headers or {}),
-        }
-
-        # Setup httpx proxy if configured
-        proxy = self.http_proxy if self.http_proxy else None
-        total_bytes = 0
-
-        async with httpx.AsyncClient(proxy=proxy, timeout=120.0, follow_redirects=True) as client:
-            async with client.stream("GET", url, headers=req_headers) as response:
-                if response.status_code not in (200, 206):
-                    raise RuntimeError(f"Download failed with HTTP {response.status_code}")
-
-                content_len = response.headers.get("content-length")
-                expected_mb = f"{int(content_len) / (1024 * 1024):.1f} MB" if content_len else "unknown size"
-                logger.info(f"Stream response 200 OK. Expected size: {expected_mb}")
-
-                with open(dest_path, "wb") as f:
-                    async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-                            total_bytes += len(chunk)
-                            if total_bytes % (10 * 1024 * 1024) < 1024 * 1024:
-                                logger.info(f"Downloaded {total_bytes / (1024 * 1024):.1f} MB...")
-
-        logger.info(f"Download completed: {total_bytes / (1024 * 1024):.2f} MB saved to {dest_path}")
+    async def download_file(
+        self,
+        url: str,
+        headers: dict,
+        dest_path: Path,
+        progress_callback: Optional[Callable[[DownloadProgress], None]] = None,
+    ) -> int:
+        """Download remote video file using multi-stream Range chunks or HLS concurrent workers."""
+        dest_path, total_bytes = await download_video(
+            url=url,
+            headers=headers,
+            dest_path=dest_path,
+            num_streams=self.chunks_per_file,
+            progress_callback=progress_callback,
+            proxy=self.http_proxy,
+        )
         return total_bytes
 
     async def upload_via_bot_api(self, chat_id: int, file_path: Path, caption: str, reply_markup: dict = None) -> dict:
         """Upload video via standard Telegram Bot API multipart (up to 50 MB)."""
-        logger.info(f"Uploading via standard Bot API to chat {chat_id}...")
+        logger.info(f"Uploading via standard Bot API to chat {chat_id} ({file_path.name})...")
         api_url = f"https://api.telegram.org/bot{self.bot_token}/sendVideo"
 
         data = {
@@ -125,7 +127,7 @@ class VideoUploader:
 
     async def upload_via_pyrogram(self, chat_id: int, file_path: Path, caption: str, reply_markup: dict = None) -> dict:
         """Upload video via Pyrogram MTProto (supports up to 2000 MB / 2 GB)."""
-        logger.info(f"Uploading via Pyrogram MTProto to chat {chat_id}...")
+        logger.info(f"Uploading via Pyrogram MTProto to chat {chat_id} ({file_path.name})...")
         app = await self._get_pyrogram_client()
         if not app:
             raise RuntimeError("Pyrogram MTProto client is not available")
@@ -138,8 +140,6 @@ class VideoUploader:
                 buttons = []
                 for b in row:
                     if "web_app" in b:
-                        # Pyrogram web_app button
-                        from pyrogram.types import WebAppInfo
                         buttons.append(InlineKeyboardButton(b["text"], web_app=WebAppInfo(url=b["web_app"]["url"])))
                     elif "url" in b:
                         buttons.append(InlineKeyboardButton(b["text"], url=b["url"]))
@@ -174,7 +174,7 @@ class VideoUploader:
             try:
                 return await self.upload_via_pyrogram(chat_id, file_path, caption, reply_markup)
             except Exception as e:
-                logger.warn(f"Pyrogram upload error: {e}. Falling back to Bot API if size <= 50MB...")
+                logger.warning(f"Pyrogram upload error: {e}. Falling back to Bot API if size <= 50MB...")
 
         # 2. If under 50 MB, use standard Telegram Bot API
         if file_size_mb <= 50.0:
@@ -183,7 +183,7 @@ class VideoUploader:
         # 3. If over 50 MB and no Pyrogram credentials
         raise RuntimeError(
             f"File is {file_size_mb:.1f} MB (> 50 MB Bot API limit). "
-            f"Please set TELEGRAM_API_ID and TELEGRAM_API_HASH in .env to enable 2 GB uploads via MTProto."
+            f"To send videos larger than 50 MB, set TELEGRAM_API_ID and TELEGRAM_API_HASH in .env from https://my.telegram.org/"
         )
 
     async def notify_callback(self, callback_url: str, payload: dict):
@@ -191,7 +191,6 @@ class VideoUploader:
         if not callback_url:
             return
 
-        logger.info(f"Sending completion callback to: {callback_url}")
         headers = {"Content-Type": "application/json"}
         if self.secret_key:
             headers["X-Auth-Token"] = self.secret_key
@@ -203,8 +202,12 @@ class VideoUploader:
             except Exception as e:
                 logger.error(f"Failed to send callback to {callback_url}: {e}")
 
-    async def process_task(self, task: dict) -> dict:
-        """Full pipeline: Download from CDN -> Upload to Telegram -> Notify Bot."""
+    async def process_task(
+        self,
+        task: dict,
+        progress_callback: Optional[Callable[[DownloadProgress], None]] = None,
+    ) -> dict:
+        """Full pipeline: Download from CDN -> Remux -> Upload to Telegram -> Notify Bot."""
         release_id = task.get("releaseId")
         type_id = task.get("typeId")
         source_id = task.get("sourceId")
@@ -216,13 +219,14 @@ class VideoUploader:
         reply_markup = task.get("replyMarkup")
         callback_url = task.get("callbackUrl")
 
-        cache_key = f"ep:{release_id}:{type_id}:{source_id}:{position}"
+        cache_key = task.get("id") or f"ep:{release_id}:{type_id}:{source_id}:{position}"
         temp_dir = Path("/tmp/botquerify_videos")
+        temp_dir.mkdir(parents=True, exist_ok=True)
         temp_path = temp_dir / f"{release_id}_{type_id}_{source_id}_{position}.mp4"
 
         try:
-            # 1. Download video
-            await self.download_file(stream_url, download_headers, temp_path)
+            # 1. Download video (Multi-chunk or HLS)
+            await self.download_file(stream_url, download_headers, temp_path, progress_callback)
 
             # 2. Upload to Telegram
             upload_result = await self.upload_video(chat_id, temp_path, caption, reply_markup)
@@ -258,6 +262,6 @@ class VideoUploader:
                     temp_path.unlink()
                     logger.info(f"Cleaned up temporary file: {temp_path}")
                 except Exception as e:
-                    logger.warn(f"Failed to unlink temp file: {e}")
+                    logger.warning(f"Failed to unlink temp file: {e}")
 
 uploader_instance = VideoUploader()
