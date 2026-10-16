@@ -87,7 +87,8 @@ async def pull_task() -> Optional[Dict[str, Any]]:
         return await local_task_queue.get()
 
     # 2. TGCloud Cloud DB check
-    res = await run_tgcloud_command("pull", {})
+    has_mtproto = bool(os.getenv("TELEGRAM_API_ID") and os.getenv("TELEGRAM_API_HASH"))
+    res = await run_tgcloud_command("pull", {"hasMtproto": has_mtproto})
     if res and res.get("ok"):
         task = res.get("task")
         if task:

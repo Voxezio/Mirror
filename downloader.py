@@ -76,7 +76,12 @@ async def get_video_duration(file_path: Path) -> float:
     return 1400.0
 
 
-async def compress_to_target_size(input_path: Path, output_path: Path, target_mb: float = 48.5) -> bool:
+async def compress_to_target_size(
+    input_path: Path,
+    output_path: Path,
+    target_mb: float = 48.5,
+    target_resolution: Optional[str] = None,
+) -> bool:
     """Compress video with FFmpeg to fit strictly under target_mb (bypassing Telegram 50MB Bot API limit)."""
     if not Path(FFMPEG_BIN).exists():
         logger.error(f"FFmpeg binary not found at {FFMPEG_BIN}")
@@ -94,9 +99,14 @@ async def compress_to_target_size(input_path: Path, output_path: Path, target_mb
     if video_bitrate < 160_000:
         video_bitrate = 160_000
 
+    scale_filter = "scale=-2:'min(720,ih)'"
+    if target_resolution and str(target_resolution).isdigit():
+        max_h = int(target_resolution)
+        scale_filter = f"scale=-2:'min({max_h},ih)'"
+
     logger.info(
         f"Compressing {input_path.name} ({input_path.stat().st_size / (1024 * 1024):.1f} MB, {duration:.0f}s) "
-        f"to target {target_mb} MB: video_bitrate={video_bitrate // 1000}k, audio_bitrate={audio_bitrate // 1000}k"
+        f"to target {target_mb} MB (scale: {scale_filter}): video_bitrate={video_bitrate // 1000}k, audio_bitrate={audio_bitrate // 1000}k"
     )
 
     cmd = [
@@ -108,7 +118,7 @@ async def compress_to_target_size(input_path: Path, output_path: Path, target_mb
         "-b:v", f"{video_bitrate}",
         "-maxrate", f"{int(video_bitrate * 1.25)}",
         "-bufsize", f"{int(video_bitrate * 2)}",
-        "-vf", "scale=-2:'min(720,ih)'",
+        "-vf", scale_filter,
         "-c:a", "aac",
         "-b:a", f"{audio_bitrate}",
         "-movflags", "+faststart",

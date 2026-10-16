@@ -175,10 +175,17 @@ class VideoUploader:
             "file_id": file_id,
         }
 
-    async def upload_video(self, chat_id: int, file_path: Path, caption: str, reply_markup: dict = None) -> dict:
+    async def upload_video(
+        self,
+        chat_id: int,
+        file_path: Path,
+        caption: str,
+        reply_markup: dict = None,
+        target_quality: str = None,
+    ) -> dict:
         """Automatically choose between Pyrogram (2 GB), direct Bot API (50 MB), or auto-compression."""
         file_size_mb = file_path.stat().st_size / (1024 * 1024)
-        logger.info(f"Target video file size: {file_size_mb:.2f} MB")
+        logger.info(f"Target video file size: {file_size_mb:.2f} MB (target quality: {target_quality or 'default'})")
 
         # 1. If Pyrogram MTProto credentials are configured, always prefer Pyrogram (up to 2000 MB)
         if self.api_id and self.api_hash and PYROGRAM_AVAILABLE:
@@ -193,11 +200,13 @@ class VideoUploader:
 
         # 3. If over 50 MB and no Pyrogram credentials, bypass 50MB limit via smart FFmpeg compression
         logger.info(
-            f"File is {file_size_mb:.1f} MB (> 50 MB limit). Bypassing limit via smart FFmpeg compression to 48.5 MB..."
+            f"File is {file_size_mb:.1f} MB (> 50 MB limit). Bypassing limit via smart FFmpeg compression to 48.5 MB ({target_quality or '720'}p)..."
         )
         compressed_path = file_path.parent / f"compressed_{file_path.name}"
         try:
-            success = await compress_to_target_size(file_path, compressed_path, target_mb=48.5)
+            success = await compress_to_target_size(
+                file_path, compressed_path, target_mb=48.5, target_resolution=target_quality
+            )
             if success and compressed_path.exists() and compressed_path.stat().st_size <= 50 * 1024 * 1024:
                 return await self.upload_via_bot_api(chat_id, compressed_path, caption, reply_markup)
         finally:
@@ -246,6 +255,8 @@ class VideoUploader:
         reply_markup = task.get("replyMarkup")
         callback_url = task.get("callbackUrl")
 
+        target_quality = task.get("quality") or (download_headers.get("targetQuality") if isinstance(download_headers, dict) else None)
+
         cache_key = task.get("id") or f"ep:{release_id}:{type_id}:{source_id}:{position}"
         temp_dir = Path("/tmp/botquerify_videos")
         temp_dir.mkdir(parents=True, exist_ok=True)
@@ -256,7 +267,7 @@ class VideoUploader:
             await self.download_file(stream_url, download_headers, temp_path, progress_callback)
 
             # 2. Upload to Telegram
-            upload_result = await self.upload_video(chat_id, temp_path, caption, reply_markup)
+            upload_result = await self.upload_video(chat_id, temp_path, caption, reply_markup, target_quality=target_quality)
             file_id = upload_result.get("file_id")
             message_id = upload_result.get("message_id")
             logger.info(f"Successfully uploaded! file_id: {file_id}, message_id: {message_id}")
